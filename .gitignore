@@ -1,0 +1,6 @@
+/target
+*.py
+.context/
+.grok/
+*.grok/
+gemini-git.py
