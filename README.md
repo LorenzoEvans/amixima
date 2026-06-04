@@ -1,5 +1,8 @@
 # Amixima
-![](./assets/amixima.png)
+![](./assets/amixima1.jpg)
+
+![](./assets/amixima2.jpg)
+
 Amixima is a Terminal User Interface (TUI) tool for audio "sculpting" and batch processing. It allows musicians and sound engineers to define a sequence of audio effects (a "Soundcourse") and apply them to multiple audio files efficiently.
 
 ## Features
