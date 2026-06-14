@@ -1,17 +1,20 @@
+mod core;
 mod dsp;
-mod ontology;
+mod error;
 mod parser;
 mod ui;
 
+use crate::core::soundcourse::{EffectNode, Soundcourse};
+use crate::core::validation::{validate_soundcourse, ValidationMode};
 use crate::dsp::{AudioPlayer, Soundsculptor};
-use crate::ontology::{EffectNode, Soundcourse};
+use crate::error::AmiximaError;
 use crate::parser::SoundcourseParser;
 use crate::ui::{StyleManager, Symbols};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use directories::ProjectDirs;
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyModifiers},
+    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     layout::{Constraint, Layout, Margin, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span, Text},
@@ -37,9 +40,46 @@ use symphonia::core::probe::Hint;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Optional path to a file or directory to open on startup
     #[arg(value_name = "PATH")]
     path: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Launch the terminal UI
+    Tui {
+        /// Optional path to a file or directory to open on startup
+        path: Option<PathBuf>,
+    },
+    /// Apply a Soundcourse to all top-level WAV files in a directory
+    Apply {
+        #[arg(long = "course")]
+        course: PathBuf,
+        #[arg(long = "input")]
+        input: PathBuf,
+        #[arg(long = "output")]
+        output: Option<PathBuf>,
+    },
+    /// Print Soundcourse metadata and ordered effects
+    Inspect {
+        #[arg(long = "course")]
+        course: Option<PathBuf>,
+        #[arg(value_name = "COURSE")]
+        path: Option<PathBuf>,
+    },
+    /// Validate a Soundcourse file
+    Validate {
+        #[arg(long = "course")]
+        course: Option<PathBuf>,
+        #[arg(value_name = "COURSE")]
+        path: Option<PathBuf>,
+    },
+    /// List supported effects, defaults, and parameter ranges
+    ListEffects,
 }
 
 // --- Persistence ---
@@ -90,7 +130,10 @@ struct AmiximaApp {
     // Processing state
     processing_file: String,
     processing_progress: f32,
+    processing_summary: String,
     spinner_frame: usize,
+    status_message: String,
+    status_is_error: bool,
 
     // Help
     show_help: bool,
@@ -125,7 +168,10 @@ impl AmiximaApp {
             save_input: String::new(),
             processing_file: String::new(),
             processing_progress: 0.0,
+            processing_summary: String::new(),
             spinner_frame: 0,
+            status_message: "Ready".to_string(),
+            status_is_error: false,
             show_help: false,
             help_scroll: 0,
             style_manager: StyleManager::new(),
@@ -145,6 +191,11 @@ impl AmiximaApp {
         app
     }
 
+    fn set_status(&mut self, message: impl Into<String>, is_error: bool) {
+        self.status_message = message.into();
+        self.status_is_error = is_error;
+    }
+
     fn set_path(&mut self, path: PathBuf) {
         if path.is_dir() {
             self.current_dir = Some(path);
@@ -158,18 +209,27 @@ impl AmiximaApp {
     fn toggle_preview(&mut self) {
         if self.audio_player.is_playing() {
             self.audio_player.stop();
+            self.set_status("Preview stopped", false);
         } else if let Some(dir) = &self.current_dir {
             if let Some(idx) = self.file_list_state.selected() {
                 if let Some(filename) = self.files.get(idx) {
                     let path = dir.join(filename);
+                    if !path.is_file() || !is_audio_file(&path) {
+                        self.set_status("Select an audio file to preview", true);
+                        return;
+                    }
                     let sc = self.soundcourse.clone();
-                    if let Ok((samples, rate, channels)) =
-                        Soundsculptor::get_processed_samples(path.to_str().unwrap(), &sc)
-                    {
-                        let _ = self.audio_player.play_samples(samples, rate, channels);
+                    match Soundsculptor::get_processed_samples(path.to_str().unwrap(), &sc)
+                        .and_then(|(samples, rate, channels)| {
+                            self.audio_player.play_samples(samples, rate, channels)
+                        }) {
+                        Ok(()) => self.set_status(format!("Previewing {filename}"), false),
+                        Err(err) => self.set_status(format!("Preview failed: {err}"), true),
                     }
                 }
             }
+        } else {
+            self.set_status("Open a directory before previewing audio", true);
         }
     }
 
@@ -177,7 +237,7 @@ impl AmiximaApp {
         self.files.clear();
         if let Some(dir) = &self.current_dir {
             let mut entries_vec = Vec::new();
-            
+
             // Add ".." if not at root
             if dir.parent().is_some() {
                 entries_vec.push("..".to_string());
@@ -188,7 +248,7 @@ impl AmiximaApp {
                     .filter_map(|entry| entry.ok())
                     .map(|entry| entry.file_name().to_string_lossy().into_owned())
                     .collect();
-                
+
                 files.sort_by(|a, b| {
                     let path_a = dir.join(a);
                     let path_b = dir.join(b);
@@ -202,9 +262,9 @@ impl AmiximaApp {
                 });
                 entries_vec.extend(files);
             }
-            
+
             self.files = entries_vec;
-            
+
             if !self.files.is_empty() {
                 self.file_list_state.select(Some(0));
             }
@@ -242,12 +302,10 @@ impl AmiximaApp {
             if let Some(idx) = self.file_list_state.selected() {
                 if let Some(filename) = self.files.get(idx) {
                     let path = dir.join(filename);
-                    if path.is_file() {
-                        if is_audio_file(&path) {
-                            if let Ok(peaks) = self.calculate_peaks(&path) {
-                                self.peak_data = peaks;
-                                return;
-                            }
+                    if path.is_file() && is_audio_file(&path) {
+                        if let Ok(peaks) = self.calculate_peaks(&path) {
+                            self.peak_data = peaks;
+                            return;
                         }
                     }
                 }
@@ -283,11 +341,7 @@ impl AmiximaApp {
         let mut count = 0;
         let max_samples = 50_000; // Reduced for responsiveness
 
-        'decode: loop {
-            let packet = match format.next_packet() {
-                Ok(packet) => packet,
-                Err(_) => break,
-            };
+        'decode: while let Ok(packet) = format.next_packet() {
             if packet.track_id() != track_id {
                 continue;
             }
@@ -338,170 +392,186 @@ impl AmiximaApp {
             self.spinner_frame = self.spinner_frame.wrapping_add(1);
 
             if event::poll(std::time::Duration::from_millis(50))? {
-                if let Event::Key(key) = event::read()? {
-                    // If help is open, handle help-specific keys
-                    if self.show_help {
-                        match key.code {
-                            KeyCode::Esc | KeyCode::Char('?') => {
-                                self.show_help = false;
-                                self.help_scroll = 0;
-                            }
-                            KeyCode::Down => {
-                                self.help_scroll += 1;
-                            }
-                            KeyCode::Up => {
-                                self.help_scroll = self.help_scroll.saturating_sub(1);
-                            }
+                match event::read()? {
+                    Event::Paste(text) => {
+                        let text = text.trim_matches(['\r', '\n']);
+                        match self.focused_pane {
+                            Pane::DirectoryInput => self.dir_input.push_str(text),
+                            Pane::SavePrompt => self.save_input.push_str(text),
                             _ => {}
                         }
-                        continue;
                     }
+                    Event::Key(key) => {
+                        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                            continue;
+                        }
 
-                    // If in DirectoryInput, handle text input
-                    if self.focused_pane == Pane::DirectoryInput {
-                        match key.code {
-                            KeyCode::Enter => {
-                                if !self.dir_input.is_empty() {
-                                    let path = PathBuf::from(&self.dir_input);
-                                    if path.exists() {
-                                        self.set_path(path);
-                                    }
+                        // If help is open, handle help-specific keys
+                        if self.show_help {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('?') => {
+                                    self.show_help = false;
+                                    self.help_scroll = 0;
                                 }
-                                self.focused_pane = Pane::FileExplorer;
-                                self.dir_input.clear();
+                                KeyCode::Down => {
+                                    self.help_scroll += 1;
+                                }
+                                KeyCode::Up => {
+                                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                                }
+                                _ => {}
                             }
-                            KeyCode::Esc => {
-                                self.focused_pane = Pane::FileExplorer;
-                                self.dir_input.clear();
-                            }
-                            KeyCode::Char(c) => {
-                                self.dir_input.push(c);
-                            }
-                            KeyCode::Backspace => {
-                                self.dir_input.pop();
-                            }
-                            _ => {}
+                            continue;
                         }
-                        continue;
-                    }
 
-                    // If in SavePrompt, handle text input
-                    if self.focused_pane == Pane::SavePrompt {
-                        match key.code {
-                            KeyCode::Enter => {
-                                if !self.save_input.is_empty() {
-                                    if let Some(dir) = &self.current_dir {
-                                        let path = dir.join(&self.save_input);
-                                        if self.save_input.ends_with(".ini") {
-                                            let _ = SoundcourseParser::serialize_to_ini(
-                                                &self.soundcourse,
-                                                path.to_str().unwrap(),
-                                            );
+                        // If in DirectoryInput, handle text input
+                        if self.focused_pane == Pane::DirectoryInput {
+                            match key.code {
+                                KeyCode::Enter => {
+                                    if !self.dir_input.is_empty() {
+                                        let path = expand_user_path(&self.dir_input);
+                                        if path.exists() {
+                                            self.set_path(path);
+                                            self.set_status("Directory loaded", false);
                                         } else {
-                                            let filename = if self.save_input.ends_with(".json") {
-                                                self.save_input.clone()
-                                            } else {
-                                                format!("{}.json", self.save_input)
-                                            };
-                                            let path = dir.join(filename);
-                                            if let Ok(json) = self.soundcourse.to_json_ld() {
-                                                let _ = fs::write(path, json);
-                                            }
+                                            self.set_status("Path does not exist", true);
                                         }
-                                        self.refresh_files();
                                     }
+                                    self.focused_pane = Pane::FileExplorer;
+                                    self.dir_input.clear();
                                 }
-                                self.focused_pane = Pane::Sequence;
-                                self.save_input.clear();
+                                KeyCode::Esc => {
+                                    self.focused_pane = Pane::FileExplorer;
+                                    self.dir_input.clear();
+                                }
+                                KeyCode::Char(c) => {
+                                    self.dir_input.push(c);
+                                }
+                                KeyCode::Backspace => {
+                                    self.dir_input.pop();
+                                }
+                                _ => {}
                             }
-                            KeyCode::Esc => {
-                                self.focused_pane = Pane::Sequence;
-                                self.save_input.clear();
-                            }
-                            KeyCode::Char(c) => {
-                                self.save_input.push(c);
-                            }
-                            KeyCode::Backspace => {
-                                self.save_input.pop();
-                            }
-                            _ => {}
+                            continue;
                         }
-                        continue;
-                    }
 
-                    // Main keybindings
-                    match key.code {
-                        KeyCode::Char('q') => {
-                            self.save_persistent_state();
-                            self.should_quit = true;
-                        }
-                        KeyCode::Char('?') => {
-                            self.show_help = true;
-                        }
-                                            KeyCode::Char('p') => {
-                                                self.toggle_preview();
+                        // If in SavePrompt, handle text input
+                        if self.focused_pane == Pane::SavePrompt {
+                            match key.code {
+                                KeyCode::Enter => {
+                                    if !self.save_input.is_empty() {
+                                        if let Some(dir) = &self.current_dir {
+                                            let dir = dir.clone();
+                                            match self.save_soundcourse(&dir) {
+                                                Ok(path) => self.set_status(
+                                                    format!(
+                                                        "Saved Soundcourse to {}",
+                                                        path.display()
+                                                    ),
+                                                    false,
+                                                ),
+                                                Err(err) => self.set_status(
+                                                    format!("Save failed: {err}"),
+                                                    true,
+                                                ),
                                             }
-                                            KeyCode::Char('o') => {
-                                                self.focused_pane = Pane::DirectoryInput;
-                                            }
-                                            KeyCode::Char('s') => {                            self.focused_pane = Pane::SavePrompt;
+                                            self.refresh_files();
+                                        } else {
+                                            self.set_status("Open a directory before saving", true);
+                                        }
+                                    }
+                                    self.focused_pane = Pane::Sequence;
+                                    self.save_input.clear();
+                                }
+                                KeyCode::Esc => {
+                                    self.focused_pane = Pane::Sequence;
+                                    self.save_input.clear();
+                                }
+                                KeyCode::Char(c) => {
+                                    self.save_input.push(c);
+                                }
+                                KeyCode::Backspace => {
+                                    self.save_input.pop();
+                                }
+                                _ => {}
+                            }
+                            continue;
                         }
-                        KeyCode::Char('d') => {
-                            if self.focused_pane == Pane::Sequence {
+
+                        // Main keybindings
+                        match key.code {
+                            KeyCode::Char('q') => {
+                                self.save_persistent_state();
+                                self.should_quit = true;
+                            }
+                            KeyCode::Char('?') => {
+                                self.show_help = true;
+                            }
+                            KeyCode::Char('p') => {
+                                self.toggle_preview();
+                            }
+                            KeyCode::Char('o') => {
+                                self.focused_pane = Pane::DirectoryInput;
+                            }
+                            KeyCode::Char('s') => {
+                                self.focused_pane = Pane::SavePrompt;
+                            }
+                            KeyCode::Char('d') if self.focused_pane == Pane::Sequence => {
                                 self.delete_node();
                             }
-                        }
-                        KeyCode::Tab => {
-                            self.focused_pane = match self.focused_pane {
-                                Pane::FileExplorer => Pane::EffectPalette,
-                                Pane::EffectPalette => Pane::Sequence,
-                                Pane::Sequence => Pane::Parameters,
-                                Pane::Parameters => Pane::FileExplorer,
-                                Pane::SavePrompt => Pane::FileExplorer,
-                                Pane::DirectoryInput => Pane::FileExplorer,
-                                Pane::Processing => Pane::FileExplorer,
-                            };
-                        }
-                        KeyCode::BackTab => {
-                            self.focused_pane = match self.focused_pane {
-                                Pane::FileExplorer => Pane::Parameters,
-                                Pane::EffectPalette => Pane::FileExplorer,
-                                Pane::Sequence => Pane::EffectPalette,
-                                Pane::Parameters => Pane::Sequence,
-                                Pane::SavePrompt => Pane::FileExplorer,
-                                Pane::DirectoryInput => Pane::FileExplorer,
-                                Pane::Processing => Pane::FileExplorer,
-                            };
-                        }
-                        KeyCode::Down => {
-                            if key.modifiers.contains(KeyModifiers::SHIFT)
-                                && self.focused_pane == Pane::Sequence
-                            {
-                                self.reorder_node(true);
-                            } else {
-                                self.handle_down();
+                            KeyCode::Tab => {
+                                self.focused_pane = match self.focused_pane {
+                                    Pane::FileExplorer => Pane::EffectPalette,
+                                    Pane::EffectPalette => Pane::Sequence,
+                                    Pane::Sequence => Pane::Parameters,
+                                    Pane::Parameters => Pane::FileExplorer,
+                                    Pane::SavePrompt => Pane::FileExplorer,
+                                    Pane::DirectoryInput => Pane::FileExplorer,
+                                    Pane::Processing => Pane::FileExplorer,
+                                };
                             }
-                        }
-                        KeyCode::Up => {
-                            if key.modifiers.contains(KeyModifiers::SHIFT)
-                                && self.focused_pane == Pane::Sequence
-                            {
-                                self.reorder_node(false);
-                            } else {
-                                self.handle_up();
+                            KeyCode::BackTab => {
+                                self.focused_pane = match self.focused_pane {
+                                    Pane::FileExplorer => Pane::Parameters,
+                                    Pane::EffectPalette => Pane::FileExplorer,
+                                    Pane::Sequence => Pane::EffectPalette,
+                                    Pane::Parameters => Pane::Sequence,
+                                    Pane::SavePrompt => Pane::FileExplorer,
+                                    Pane::DirectoryInput => Pane::FileExplorer,
+                                    Pane::Processing => Pane::FileExplorer,
+                                };
                             }
-                        }
-                        KeyCode::Left => self.handle_left(),
-                        KeyCode::Right => self.handle_right(),
-                        KeyCode::Enter => {
-                            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                                let _ = self.process_files(terminal);
-                            } else {
-                                self.handle_enter();
+                            KeyCode::Down => {
+                                if key.modifiers.contains(KeyModifiers::SHIFT)
+                                    && self.focused_pane == Pane::Sequence
+                                {
+                                    self.reorder_node(true);
+                                } else {
+                                    self.handle_down();
+                                }
                             }
+                            KeyCode::Up => {
+                                if key.modifiers.contains(KeyModifiers::SHIFT)
+                                    && self.focused_pane == Pane::Sequence
+                                {
+                                    self.reorder_node(false);
+                                } else {
+                                    self.handle_up();
+                                }
+                            }
+                            KeyCode::Left => self.handle_left(),
+                            KeyCode::Right => self.handle_right(),
+                            KeyCode::Enter => {
+                                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                    let _ = self.process_files(terminal);
+                                } else {
+                                    self.handle_enter();
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
         }
@@ -512,6 +582,7 @@ impl AmiximaApp {
         if let Some(idx) = self.sequence_state.selected() {
             if idx < self.soundcourse.sequence.len() {
                 self.soundcourse.sequence.remove(idx);
+                self.set_status("Effect removed", false);
                 if self.soundcourse.sequence.is_empty() {
                     self.sequence_state.select(None);
                     self.parameter_state.select(None);
@@ -530,11 +601,13 @@ impl AmiximaApp {
                 if idx < len - 1 {
                     self.soundcourse.sequence.swap(idx, idx + 1);
                     self.sequence_state.select(Some(idx + 1));
+                    self.set_status("Effect moved down", false);
                 }
             } else {
                 if idx > 0 {
                     self.soundcourse.sequence.swap(idx, idx - 1);
                     self.sequence_state.select(Some(idx - 1));
+                    self.set_status("Effect moved up", false);
                 }
             }
         }
@@ -543,52 +616,129 @@ impl AmiximaApp {
     fn process_files(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         if let Some(dir) = self.current_dir.clone() {
             let output_dir = dir.join("output");
-            if !output_dir.exists() {
-                fs::create_dir_all(&output_dir)?;
+            if let Err(err) = fs::create_dir_all(&output_dir) {
+                self.set_status(format!("Could not create output directory: {err}"), true);
+                return Ok(());
             }
 
             let audio_files: Vec<String> = self
                 .files
                 .iter()
-                .filter(|f| is_audio_file(&dir.join(f)))
+                .filter(|f| is_wav_file(&dir.join(f)))
                 .cloned()
                 .collect();
 
             if audio_files.is_empty() {
+                self.set_status("No WAV files found in the current directory", true);
+                return Ok(());
+            }
+
+            if let Err(err) = validate_soundcourse(&self.soundcourse, ValidationMode::Strict) {
+                self.set_status(format!("Soundcourse is invalid: {err}"), true);
                 return Ok(());
             }
 
             self.focused_pane = Pane::Processing;
             let total = audio_files.len();
+            let mut succeeded = 0usize;
+            let mut failed = 0usize;
 
             for (i, file_name) in audio_files.iter().enumerate() {
                 self.processing_file = file_name.clone();
                 self.processing_progress = (i as f32) / (total as f32);
+                self.processing_summary =
+                    format!("{succeeded} succeeded, {failed} failed of {total}");
                 terminal.draw(|f| self.draw(f))?;
 
                 let input_path = dir.join(file_name);
-                let output_name = format!(
-                    "{}_processed.wav",
-                    PathBuf::from(file_name)
-                        .file_stem()
-                        .unwrap()
-                        .to_str()
-                        .unwrap()
-                );
-                let output_path = output_dir.join(output_name);
+                let output_path = unique_output_path(&output_dir, file_name);
 
-                Soundsculptor::apply_soundcourse(
+                match Soundsculptor::apply_soundcourse(
                     input_path.to_str().unwrap(),
                     output_path.to_str().unwrap(),
                     &self.soundcourse,
-                )?;
+                ) {
+                    Ok(()) => succeeded += 1,
+                    Err(_) => failed += 1,
+                }
             }
 
             self.processing_progress = 1.0;
+            self.processing_summary = format!("{succeeded} succeeded, {failed} failed of {total}");
             terminal.draw(|f| self.draw(f))?;
             self.focused_pane = Pane::FileExplorer;
+            self.refresh_files();
+            if failed == 0 {
+                self.set_status(
+                    format!("Processed {succeeded} WAV file(s) into output/"),
+                    false,
+                );
+            } else {
+                self.set_status(
+                    format!("Processed {succeeded} file(s); {failed} failed"),
+                    true,
+                );
+            }
+        } else {
+            self.set_status("Open a directory before processing audio", true);
         }
         Ok(())
+    }
+
+    fn save_soundcourse(&self, dir: &Path) -> Result<PathBuf> {
+        let requested = self.save_input.trim();
+        if requested.is_empty() {
+            return Err(color_eyre::eyre::eyre!("filename is empty"));
+        }
+
+        let filename = if requested.ends_with(".ini")
+            || requested.ends_with(".json")
+            || requested.ends_with(".jsonld")
+        {
+            requested.to_string()
+        } else {
+            format!("{requested}.jsonld")
+        };
+
+        let path = dir.join(filename);
+        if requested.ends_with(".ini") {
+            SoundcourseParser::serialize_to_ini(&self.soundcourse, &path)
+                .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+        } else {
+            SoundcourseParser::serialize_to_json_ld(&self.soundcourse, &path)
+                .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+        }
+        Ok(path)
+    }
+
+    fn load_soundcourse(&mut self, path: &Path) {
+        let result = SoundcourseParser::parse_path_lenient(path);
+
+        match result {
+            Ok(sc) => {
+                let warning = validate_soundcourse(&sc, ValidationMode::UiFriendly)
+                    .ok()
+                    .and_then(|report| report.warnings.into_iter().next());
+                self.soundcourse = sc;
+                if self.soundcourse.sequence.is_empty() {
+                    self.sequence_state.select(None);
+                    self.parameter_state.select(None);
+                } else {
+                    self.sequence_state.select(Some(0));
+                    self.parameter_state.select(Some(0));
+                }
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Soundcourse");
+                if let Some(warning) = warning {
+                    self.set_status(format!("Loaded {name} with warning: {warning}"), false);
+                } else {
+                    self.set_status(format!("Loaded {name}"), false);
+                }
+            }
+            Err(err) => self.set_status(format!("Load failed: {err}"), true),
+        }
     }
 
     fn handle_left(&mut self) {
@@ -615,7 +765,7 @@ impl AmiximaApp {
                                 if param_idx == 0 {
                                     *delay_ms = (*delay_ms - 10.0).max(0.0);
                                 } else {
-                                    *feedback = (*feedback - 0.05).clamp(0.0, 1.0);
+                                    *feedback = (*feedback - 0.05).clamp(0.0, 0.95);
                                 }
                             }
                             EffectNode::Compressor { threshold, ratio } => {
@@ -626,7 +776,7 @@ impl AmiximaApp {
                                 }
                             }
                             EffectNode::Gain { gain_db } => {
-                                *gain_db -= 0.5;
+                                *gain_db = (*gain_db - 0.5).clamp(-24.0, 24.0);
                             }
                         }
                     }
@@ -659,7 +809,7 @@ impl AmiximaApp {
                                 if param_idx == 0 {
                                     *delay_ms = (*delay_ms + 10.0).min(2000.0);
                                 } else {
-                                    *feedback = (*feedback + 0.05).clamp(0.0, 1.0);
+                                    *feedback = (*feedback + 0.05).clamp(0.0, 0.95);
                                 }
                             }
                             EffectNode::Compressor { threshold, ratio } => {
@@ -670,7 +820,7 @@ impl AmiximaApp {
                                 }
                             }
                             EffectNode::Gain { gain_db } => {
-                                *gain_db += 0.5;
+                                *gain_db = (*gain_db + 0.5).clamp(-24.0, 24.0);
                             }
                         }
                     }
@@ -837,18 +987,14 @@ impl AmiximaApp {
                             if new_path.is_dir() {
                                 self.current_dir = Some(new_path);
                                 self.refresh_files();
-                            } else if filename.to_lowercase().ends_with(".ini") {
-                                if let Ok(sc) =
-                                    SoundcourseParser::parse_ini(new_path.to_str().unwrap())
-                                {
-                                    self.soundcourse = sc;
-                                    if !self.soundcourse.sequence.is_empty() {
-                                        self.sequence_state.select(Some(0));
-                                    } else {
-                                        self.sequence_state.select(None);
-                                    }
-                                    self.parameter_state.select(None);
-                                }
+                                self.set_status("Directory loaded", false);
+                            } else if is_soundcourse_file(&new_path) {
+                                self.load_soundcourse(&new_path);
+                            } else if new_path.is_file() {
+                                self.set_status(
+                                    "Use p to preview audio or select a Soundcourse file",
+                                    false,
+                                );
                             }
                         }
                     }
@@ -856,7 +1002,7 @@ impl AmiximaApp {
             }
             Pane::EffectPalette => {
                 if let Some(idx) = self.palette_state.selected() {
-                    if let Some(effect_name) = self.effects_palette.get(idx) {
+                    if let Some(effect_name) = self.effects_palette.get(idx).cloned() {
                         let node = match effect_name.as_str() {
                             "Reverb" => EffectNode::Reverb {
                                 room_size: 0.5,
@@ -880,6 +1026,8 @@ impl AmiximaApp {
                         self.soundcourse.sequence.push(node);
                         self.sequence_state
                             .select(Some(self.soundcourse.sequence.len() - 1));
+                        self.parameter_state.select(Some(0));
+                        self.set_status(format!("Added {effect_name}"), false);
                     }
                 }
             }
@@ -921,20 +1069,35 @@ impl AmiximaApp {
             .border_set(ratatui::symbols::border::THICK)
             .border_style(Style::default().fg(self.style_manager.palette.accent_cyan))
             .bg(self.style_manager.palette.surface);
-        
+
         f.render_widget(block, area);
-        
-        let inner = area.inner(Margin { horizontal: 2, vertical: 1 });
+
+        let inner = area.inner(Margin {
+            horizontal: 2,
+            vertical: 1,
+        });
         let title_chunks = Layout::horizontal([
             Constraint::Length(25),
             Constraint::Min(0),
             Constraint::Length(30),
-        ]).split(inner);
+        ])
+        .split(inner);
 
         let title = Text::from(vec![Line::from(vec![
-            Span::styled(" AMIXIMA ", Style::default().fg(self.style_manager.palette.accent_fuchsia).bold()),
-            Span::styled("⬡", Style::default().fg(self.style_manager.palette.accent_cyan)),
-            Span::styled(" Audio Sculptor ", Style::default().fg(self.style_manager.palette.text_bright)),
+            Span::styled(
+                " AMIXIMA ",
+                Style::default()
+                    .fg(self.style_manager.palette.accent_fuchsia)
+                    .bold(),
+            ),
+            Span::styled(
+                "⬡",
+                Style::default().fg(self.style_manager.palette.accent_cyan),
+            ),
+            Span::styled(
+                " Audio Sculptor ",
+                Style::default().fg(self.style_manager.palette.text_bright),
+            ),
         ])]);
         f.render_widget(Paragraph::new(title), title_chunks[0]);
 
@@ -946,9 +1109,16 @@ impl AmiximaApp {
 
         let time_str = chrono::Local::now().format("%H:%M:%S").to_string();
         let info = Line::from(vec![
-            Span::styled(format!(" {} ", Symbols::NAV_INDICATOR), Style::default().fg(self.style_manager.palette.accent_gold)),
-            Span::styled(time_str, Style::default().fg(self.style_manager.palette.text_dim)),
-        ]).right_aligned();
+            Span::styled(
+                format!(" {} ", Symbols::NAV_INDICATOR),
+                Style::default().fg(self.style_manager.palette.accent_gold),
+            ),
+            Span::styled(
+                time_str,
+                Style::default().fg(self.style_manager.palette.text_dim),
+            ),
+        ])
+        .right_aligned();
         f.render_widget(Paragraph::new(info), title_chunks[2]);
     }
 
@@ -962,12 +1132,13 @@ impl AmiximaApp {
 
         self.draw_file_explorer(f, chunks[0]);
         self.draw_effect_palette(f, chunks[1]);
-        
+
         let right_chunks = Layout::vertical([
             Constraint::Percentage(60), // Sequence
             Constraint::Percentage(40), // Parameters
-        ]).split(chunks[2]);
-        
+        ])
+        .split(chunks[2]);
+
         self.draw_sequence(f, right_chunks[0]);
         self.draw_parameters(f, right_chunks[1]);
     }
@@ -976,7 +1147,12 @@ impl AmiximaApp {
         let active = self.focused_pane == Pane::FileExplorer;
         let block = Block::bordered()
             .title(Line::from(vec![
-                Span::styled(" 1 ", Style::default().fg(self.style_manager.palette.accent_gold).bold()),
+                Span::styled(
+                    " 1 ",
+                    Style::default()
+                        .fg(self.style_manager.palette.accent_gold)
+                        .bold(),
+                ),
                 Span::styled(" FILES ", self.style_manager.title_style(active)),
             ]))
             .border_type(self.style_manager.border_type(active))
@@ -984,23 +1160,27 @@ impl AmiximaApp {
             .padding(Padding::horizontal(1));
 
         if let Some(dir) = &self.current_dir {
-            let items: Vec<ListItem> = self.files.iter().map(|f| {
-                let path = dir.join(f);
-                let (icon, color) = if path.is_dir() {
-                    (Symbols::DIR_ICON, self.style_manager.palette.accent_cyan)
-                } else if is_audio_file(&path) {
-                    (Symbols::AUDIO_ICON, self.style_manager.palette.accent_green)
-                } else if f.ends_with(".ini") || f.ends_with(".json") {
-                    (Symbols::CONFIG_ICON, self.style_manager.palette.accent_gold)
-                } else {
-                    (Symbols::FILE_ICON, self.style_manager.palette.text_dim)
-                };
+            let items: Vec<ListItem> = self
+                .files
+                .iter()
+                .map(|f| {
+                    let path = dir.join(f);
+                    let (icon, color) = if path.is_dir() {
+                        (Symbols::DIR_ICON, self.style_manager.palette.accent_cyan)
+                    } else if is_audio_file(&path) {
+                        (Symbols::AUDIO_ICON, self.style_manager.palette.accent_green)
+                    } else if f.ends_with(".ini") || f.ends_with(".json") {
+                        (Symbols::CONFIG_ICON, self.style_manager.palette.accent_gold)
+                    } else {
+                        (Symbols::FILE_ICON, self.style_manager.palette.text_dim)
+                    };
 
-                ListItem::new(Line::from(vec![
-                    Span::styled(icon, Style::default().fg(color)),
-                    Span::raw(f),
-                ]))
-            }).collect();
+                    ListItem::new(Line::from(vec![
+                        Span::styled(icon, Style::default().fg(color)),
+                        Span::raw(f),
+                    ]))
+                })
+                .collect();
 
             let list = List::new(items)
                 .block(block)
@@ -1016,19 +1196,31 @@ impl AmiximaApp {
         let active = self.focused_pane == Pane::EffectPalette;
         let block = Block::bordered()
             .title(Line::from(vec![
-                Span::styled(" 2 ", Style::default().fg(self.style_manager.palette.accent_gold).bold()),
+                Span::styled(
+                    " 2 ",
+                    Style::default()
+                        .fg(self.style_manager.palette.accent_gold)
+                        .bold(),
+                ),
                 Span::styled(" AUFX PALETTE ", self.style_manager.title_style(active)),
             ]))
             .border_type(self.style_manager.border_type(active))
             .border_style(self.style_manager.block_style(active))
             .padding(Padding::horizontal(1));
 
-        let items: Vec<ListItem> = self.effects_palette.iter().map(|e| {
-            ListItem::new(Line::from(vec![
-                Span::styled(Symbols::ITEM_MARKER, Style::default().fg(self.style_manager.palette.accent_fuchsia)),
-                Span::raw(e),
-            ]))
-        }).collect();
+        let items: Vec<ListItem> = self
+            .effects_palette
+            .iter()
+            .map(|e| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        Symbols::ITEM_MARKER,
+                        Style::default().fg(self.style_manager.palette.accent_fuchsia),
+                    ),
+                    Span::raw(e),
+                ]))
+            })
+            .collect();
 
         let list = List::new(items)
             .block(block)
@@ -1041,27 +1233,41 @@ impl AmiximaApp {
         let active = self.focused_pane == Pane::Sequence;
         let block = Block::bordered()
             .title(Line::from(vec![
-                Span::styled(" 3 ", Style::default().fg(self.style_manager.palette.accent_gold).bold()),
+                Span::styled(
+                    " 3 ",
+                    Style::default()
+                        .fg(self.style_manager.palette.accent_gold)
+                        .bold(),
+                ),
                 Span::styled(" SOUNDCOURSE ", self.style_manager.title_style(active)),
             ]))
             .border_type(self.style_manager.border_type(active))
             .border_style(self.style_manager.block_style(active))
             .padding(Padding::horizontal(1));
 
-        let items: Vec<ListItem> = self.soundcourse.sequence.iter().enumerate().map(|(i, node)| {
-            let label = match node {
-                EffectNode::Reverb { .. } => "Reverb",
-                EffectNode::EQ { .. } => "EQ",
-                EffectNode::Delay { .. } => "Delay",
-                EffectNode::Compressor { .. } => "Compressor",
-                EffectNode::Gain { .. } => "Gain",
-            };
-            
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{:02} ", i + 1), Style::default().fg(self.style_manager.palette.text_dim)),
-                Span::styled(label, Style::default().bold()),
-            ]))
-        }).collect();
+        let items: Vec<ListItem> = self
+            .soundcourse
+            .sequence
+            .iter()
+            .enumerate()
+            .map(|(i, node)| {
+                let label = match node {
+                    EffectNode::Reverb { .. } => "Reverb",
+                    EffectNode::EQ { .. } => "EQ",
+                    EffectNode::Delay { .. } => "Delay",
+                    EffectNode::Compressor { .. } => "Compressor",
+                    EffectNode::Gain { .. } => "Gain",
+                };
+
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:02} ", i + 1),
+                        Style::default().fg(self.style_manager.palette.text_dim),
+                    ),
+                    Span::styled(label, Style::default().bold()),
+                ]))
+            })
+            .collect();
 
         let list = List::new(items)
             .block(block)
@@ -1074,7 +1280,12 @@ impl AmiximaApp {
         let active = self.focused_pane == Pane::Parameters;
         let block = Block::bordered()
             .title(Line::from(vec![
-                Span::styled(" 4 ", Style::default().fg(self.style_manager.palette.accent_gold).bold()),
+                Span::styled(
+                    " 4 ",
+                    Style::default()
+                        .fg(self.style_manager.palette.accent_gold)
+                        .bold(),
+                ),
                 Span::styled(" PARAMETERS ", self.style_manager.title_style(active)),
             ]))
             .border_type(self.style_manager.border_type(active))
@@ -1111,16 +1322,23 @@ impl AmiximaApp {
         let inner_area = block.inner(area);
         f.render_widget(block, area);
 
-        let chunks = Layout::vertical(
-            vec![Constraint::Length(2); param_list.len()]
-        ).split(inner_area);
+        let chunks =
+            Layout::vertical(vec![Constraint::Length(2); param_list.len()]).split(inner_area);
 
         for (i, (name, val)) in param_list.iter().enumerate() {
             let is_selected = self.parameter_state.selected() == Some(i) && active;
-            let color = if is_selected { self.style_manager.palette.accent_fuchsia } else { self.style_manager.palette.accent_cyan };
-            
+            let color = if is_selected {
+                self.style_manager.palette.accent_fuchsia
+            } else {
+                self.style_manager.palette.accent_cyan
+            };
+
             let gauge = Gauge::default()
-                .gauge_style(Style::default().fg(color).bg(self.style_manager.palette.selection_bg))
+                .gauge_style(
+                    Style::default()
+                        .fg(color)
+                        .bg(self.style_manager.palette.selection_bg),
+                )
                 .ratio(*val as f64)
                 .label(format!("{} : {:.2}", name, val));
             f.render_widget(gauge, chunks[i]);
@@ -1132,64 +1350,121 @@ impl AmiximaApp {
             .bg(self.style_manager.palette.surface)
             .borders(Borders::TOP)
             .border_style(Style::default().fg(self.style_manager.palette.border_inactive));
-        
+
         f.render_widget(block, area);
-        
-        let inner = area.inner(Margin { horizontal: 1, vertical: 1 });
+
+        let inner = area.inner(Margin {
+            horizontal: 1,
+            vertical: 1,
+        });
         let chunks = Layout::horizontal([
             Constraint::Length(20),
+            Constraint::Min(20),
             Constraint::Min(0),
-        ]).split(inner);
+        ])
+        .split(inner);
 
-        let pane_name = format!(" FOCUS: {} ", match self.focused_pane {
-            Pane::FileExplorer => "FILES",
-            Pane::EffectPalette => "PALETTE",
-            Pane::Sequence => "SEQUENCE",
-            Pane::Parameters => "PARAMETERS",
-            Pane::SavePrompt => "SAVE",
-            Pane::DirectoryInput => "OPEN DIR",
-            Pane::Processing => "SCULPTING",
-        });
+        let pane_name = format!(
+            " FOCUS: {} ",
+            match self.focused_pane {
+                Pane::FileExplorer => "FILES",
+                Pane::EffectPalette => "PALETTE",
+                Pane::Sequence => "SEQUENCE",
+                Pane::Parameters => "PARAMETERS",
+                Pane::SavePrompt => "SAVE",
+                Pane::DirectoryInput => "OPEN DIR",
+                Pane::Processing => "SCULPTING",
+            }
+        );
 
-        f.render_widget(Paragraph::new(Span::styled(pane_name, Style::default().bg(self.style_manager.palette.accent_cyan).fg(Color::Black).bold())), chunks[0]);
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                pane_name,
+                Style::default()
+                    .bg(self.style_manager.palette.accent_cyan)
+                    .fg(Color::Black)
+                    .bold(),
+            )),
+            chunks[0],
+        );
+
+        let status_style = if self.status_is_error {
+            Style::default().fg(self.style_manager.palette.error).bold()
+        } else {
+            Style::default().fg(self.style_manager.palette.success)
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!(" {}", self.status_message),
+                status_style,
+            )),
+            chunks[1],
+        );
 
         let hints = Line::from(vec![
-            Span::styled(" [Tab] ", Style::default().fg(self.style_manager.palette.accent_gold)),
+            Span::styled(
+                " [Tab] ",
+                Style::default().fg(self.style_manager.palette.accent_gold),
+            ),
             Span::raw("Cycle "),
-            Span::styled(" [o] ", Style::default().fg(self.style_manager.palette.accent_gold)),
+            Span::styled(
+                " [o] ",
+                Style::default().fg(self.style_manager.palette.accent_gold),
+            ),
             Span::raw("Open Dir "),
-            Span::styled(" [p] ", Style::default().fg(self.style_manager.palette.accent_gold)),
+            Span::styled(
+                " [p] ",
+                Style::default().fg(self.style_manager.palette.accent_gold),
+            ),
             Span::raw("Preview "),
-            Span::styled(" [s] ", Style::default().fg(self.style_manager.palette.accent_gold)),
+            Span::styled(
+                " [s] ",
+                Style::default().fg(self.style_manager.palette.accent_gold),
+            ),
             Span::raw("Save "),
-            Span::styled(" [Ctrl+Enter] ", Style::default().fg(self.style_manager.palette.accent_gold)),
+            Span::styled(
+                " [Ctrl+Enter] ",
+                Style::default().fg(self.style_manager.palette.accent_gold),
+            ),
             Span::raw("Process All "),
-            Span::styled(" [?] ", Style::default().fg(self.style_manager.palette.accent_gold)),
+            Span::styled(
+                " [?] ",
+                Style::default().fg(self.style_manager.palette.accent_gold),
+            ),
             Span::raw("Help "),
-        ]).right_aligned();
-        f.render_widget(Paragraph::new(hints), chunks[1]);
+        ])
+        .right_aligned();
+        f.render_widget(Paragraph::new(hints), chunks[2]);
     }
 
     fn draw_save_modal(&self, f: &mut Frame) {
         let area = centered_rect(50, 20, f.area());
         f.render_widget(Clear, area);
-        
+
         let block = Block::bordered()
             .title(" SAVE SOUNDCOURSE ")
             .border_type(BorderType::Double)
             .border_style(Style::default().fg(self.style_manager.palette.accent_gold))
             .bg(self.style_manager.palette.background)
             .padding(Padding::uniform(1));
-        
+
         let inner = block.inner(area);
         f.render_widget(block, area);
-        
+
         let text = vec![
             Line::from("Enter filename (.ini or .json):"),
             Line::from(""),
             Line::from(vec![
-                Span::styled(Symbols::FOCUS_MARKER, Style::default().fg(self.style_manager.palette.accent_fuchsia)),
-                Span::styled(&self.save_input, Style::default().fg(self.style_manager.palette.text_bright).underlined()),
+                Span::styled(
+                    Symbols::FOCUS_MARKER,
+                    Style::default().fg(self.style_manager.palette.accent_fuchsia),
+                ),
+                Span::styled(
+                    &self.save_input,
+                    Style::default()
+                        .fg(self.style_manager.palette.text_bright)
+                        .underlined(),
+                ),
             ]),
         ];
         f.render_widget(Paragraph::new(text), inner);
@@ -1198,23 +1473,31 @@ impl AmiximaApp {
     fn draw_directory_modal(&self, f: &mut Frame) {
         let area = centered_rect(60, 20, f.area());
         f.render_widget(Clear, area);
-        
+
         let block = Block::bordered()
             .title(" OPEN DIRECTORY ")
             .border_type(BorderType::Double)
             .border_style(Style::default().fg(self.style_manager.palette.accent_cyan))
             .bg(self.style_manager.palette.background)
             .padding(Padding::uniform(1));
-        
+
         let inner = block.inner(area);
         f.render_widget(block, area);
-        
+
         let text = vec![
             Line::from("Enter absolute path to audio directory:"),
             Line::from(""),
             Line::from(vec![
-                Span::styled(Symbols::FOCUS_MARKER, Style::default().fg(self.style_manager.palette.accent_fuchsia)),
-                Span::styled(&self.dir_input, Style::default().fg(self.style_manager.palette.text_bright).underlined()),
+                Span::styled(
+                    Symbols::FOCUS_MARKER,
+                    Style::default().fg(self.style_manager.palette.accent_fuchsia),
+                ),
+                Span::styled(
+                    &self.dir_input,
+                    Style::default()
+                        .fg(self.style_manager.palette.text_bright)
+                        .underlined(),
+                ),
             ]),
         ];
         f.render_widget(Paragraph::new(text), inner);
@@ -1223,14 +1506,14 @@ impl AmiximaApp {
     fn draw_processing_modal(&self, f: &mut Frame) {
         let area = centered_rect(60, 25, f.area());
         f.render_widget(Clear, area);
-        
+
         let block = Block::bordered()
             .title(" SCULPTING AUDIO ")
             .border_type(BorderType::Double)
             .border_style(Style::default().fg(self.style_manager.palette.accent_cyan))
             .bg(self.style_manager.palette.background)
             .padding(Padding::uniform(2));
-        
+
         let inner = block.inner(area);
         f.render_widget(block, area);
 
@@ -1238,52 +1521,153 @@ impl AmiximaApp {
             Constraint::Length(1),
             Constraint::Length(3),
             Constraint::Length(1),
-        ]).split(inner);
+        ])
+        .split(inner);
 
         let spinner_char = SPINNER[self.spinner_frame % SPINNER.len()];
         let title = Line::from(vec![
-            Span::styled(spinner_char, Style::default().fg(self.style_manager.palette.accent_fuchsia).bold()),
+            Span::styled(
+                spinner_char,
+                Style::default()
+                    .fg(self.style_manager.palette.accent_fuchsia)
+                    .bold(),
+            ),
             Span::raw(" Processing: "),
-            Span::styled(&self.processing_file, Style::default().fg(self.style_manager.palette.text_bright).italic()),
+            Span::styled(
+                &self.processing_file,
+                Style::default()
+                    .fg(self.style_manager.palette.text_bright)
+                    .italic(),
+            ),
         ]);
         f.render_widget(Paragraph::new(title), chunks[0]);
 
         let gauge = Gauge::default()
-            .gauge_style(Style::default().fg(self.style_manager.palette.accent_green).bg(self.style_manager.palette.selection_bg))
+            .gauge_style(
+                Style::default()
+                    .fg(self.style_manager.palette.accent_green)
+                    .bg(self.style_manager.palette.selection_bg),
+            )
             .percent((self.processing_progress * 100.0) as u16)
             .label(format!("{:.1}%", self.processing_progress * 100.0));
         f.render_widget(gauge, chunks[1]);
+
+        f.render_widget(
+            Paragraph::new(self.processing_summary.as_str())
+                .style(Style::default().fg(self.style_manager.palette.text_dim)),
+            chunks[2],
+        );
     }
 
     fn draw_help_modal(&self, f: &mut Frame) {
         let area = centered_rect(70, 70, f.area());
         f.render_widget(Clear, area);
-        
+
         let block = Block::bordered()
             .title(" AMIXIMA COMMANDS ")
             .border_type(BorderType::Double)
             .border_style(Style::default().fg(self.style_manager.palette.accent_green))
             .bg(self.style_manager.palette.background)
             .padding(Padding::uniform(1));
-        
+
         let help_content = vec![
-            Line::from(vec![Span::styled("Navigation", Style::default().fg(self.style_manager.palette.accent_fuchsia).bold())]),
-            Line::from(vec![Span::styled("  Tab        ", Style::default().fg(self.style_manager.palette.accent_gold)), Span::raw("Cycle focus between panes")]),
-            Line::from(vec![Span::styled("  ↑/↓        ", Style::default().fg(self.style_manager.palette.accent_gold)), Span::raw("Navigate lists / parameters")]),
-            Line::from(vec![Span::styled("  Enter      ", Style::default().fg(self.style_manager.palette.accent_gold)), Span::raw("Select / Action")]),
+            Line::from(vec![Span::styled(
+                "Navigation",
+                Style::default()
+                    .fg(self.style_manager.palette.accent_fuchsia)
+                    .bold(),
+            )]),
+            Line::from(vec![
+                Span::styled(
+                    "  Tab        ",
+                    Style::default().fg(self.style_manager.palette.accent_gold),
+                ),
+                Span::raw("Cycle focus between panes"),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "  ↑/↓        ",
+                    Style::default().fg(self.style_manager.palette.accent_gold),
+                ),
+                Span::raw("Navigate lists / parameters"),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "  Enter      ",
+                    Style::default().fg(self.style_manager.palette.accent_gold),
+                ),
+                Span::raw("Select / Action"),
+            ]),
             Line::from(""),
-            Line::from(vec![Span::styled("Audio Controls", Style::default().fg(self.style_manager.palette.accent_fuchsia).bold())]),
-            Line::from(vec![Span::styled("  p          ", Style::default().fg(self.style_manager.palette.accent_gold)), Span::raw("Toggle Preview playback")]),
-            Line::from(vec![Span::styled("  Ctrl+Enter ", Style::default().fg(self.style_manager.palette.accent_gold)), Span::raw("Batch process all files")]),
+            Line::from(vec![Span::styled(
+                "Audio Controls",
+                Style::default()
+                    .fg(self.style_manager.palette.accent_fuchsia)
+                    .bold(),
+            )]),
+            Line::from(vec![
+                Span::styled(
+                    "  p          ",
+                    Style::default().fg(self.style_manager.palette.accent_gold),
+                ),
+                Span::raw("Toggle Preview playback"),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "  Ctrl+Enter ",
+                    Style::default().fg(self.style_manager.palette.accent_gold),
+                ),
+                Span::raw("Batch process all files"),
+            ]),
             Line::from(""),
-            Line::from(vec![Span::styled("Sequence Management", Style::default().fg(self.style_manager.palette.accent_fuchsia).bold())]),
-            Line::from(vec![Span::styled("  Shift+↑/↓  ", Style::default().fg(self.style_manager.palette.accent_gold)), Span::raw("Move effect in sequence")]),
-            Line::from(vec![Span::styled("  d          ", Style::default().fg(self.style_manager.palette.accent_gold)), Span::raw("Delete selected effect")]),
-            Line::from(vec![Span::styled("  s          ", Style::default().fg(self.style_manager.palette.accent_gold)), Span::raw("Save current Soundcourse")]),
+            Line::from(vec![Span::styled(
+                "Sequence Management",
+                Style::default()
+                    .fg(self.style_manager.palette.accent_fuchsia)
+                    .bold(),
+            )]),
+            Line::from(vec![
+                Span::styled(
+                    "  Shift+↑/↓  ",
+                    Style::default().fg(self.style_manager.palette.accent_gold),
+                ),
+                Span::raw("Move effect in sequence"),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "  d          ",
+                    Style::default().fg(self.style_manager.palette.accent_gold),
+                ),
+                Span::raw("Delete selected effect"),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "  s          ",
+                    Style::default().fg(self.style_manager.palette.accent_gold),
+                ),
+                Span::raw("Save current Soundcourse"),
+            ]),
             Line::from(""),
-            Line::from(vec![Span::styled("Global", Style::default().fg(self.style_manager.palette.accent_fuchsia).bold())]),
-            Line::from(vec![Span::styled("  ?          ", Style::default().fg(self.style_manager.palette.accent_gold)), Span::raw("Toggle this help")]),
-            Line::from(vec![Span::styled("  q          ", Style::default().fg(self.style_manager.palette.accent_gold)), Span::raw("Quit Amixima")]),
+            Line::from(vec![Span::styled(
+                "Global",
+                Style::default()
+                    .fg(self.style_manager.palette.accent_fuchsia)
+                    .bold(),
+            )]),
+            Line::from(vec![
+                Span::styled(
+                    "  ?          ",
+                    Style::default().fg(self.style_manager.palette.accent_gold),
+                ),
+                Span::raw("Toggle this help"),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    "  q          ",
+                    Style::default().fg(self.style_manager.palette.accent_gold),
+                ),
+                Span::raw("Quit Amixima"),
+            ]),
         ];
 
         let paragraph = Paragraph::new(help_content)
@@ -1300,6 +1684,59 @@ fn is_audio_file(path: &Path) -> bool {
     } else {
         false
     }
+}
+
+fn is_wav_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("wav"))
+            .unwrap_or(false)
+}
+
+fn is_soundcourse_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| {
+            let ext = ext.to_lowercase();
+            ext == "ini" || ext == "json" || ext == "jsonld"
+        })
+        .unwrap_or(false)
+}
+
+fn unique_output_path(output_dir: &Path, input_name: &str) -> PathBuf {
+    let stem = Path::new(input_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("audio");
+    let mut candidate = output_dir.join(format!("{stem}_processed.wav"));
+    let mut suffix = 2;
+
+    while candidate.exists() {
+        candidate = output_dir.join(format!("{stem}_processed_{suffix}.wav"));
+        suffix += 1;
+    }
+
+    candidate
+}
+
+fn expand_user_path(input: &str) -> PathBuf {
+    let trimmed = input.trim();
+    if trimmed == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+
+    PathBuf::from(trimmed)
 }
 
 /// helper function to create a centered rect using up certain percentage of the available rect `r`
@@ -1327,9 +1764,210 @@ fn main() -> Result<()> {
     color_eyre::install()?;
     let args = Args::parse();
 
+    if let Some(command) = args.command {
+        return run_command(command).map_err(|err| color_eyre::eyre::eyre!(err.to_string()));
+    }
+
+    run_tui(args.path)?;
+    Ok(())
+}
+
+fn run_tui(path: Option<PathBuf>) -> Result<()> {
     ratatui::run(|terminal| {
-        let mut app = AmiximaApp::new(args.path);
+        let mut app = AmiximaApp::new(path);
         app.run(terminal)
     })?;
     Ok(())
+}
+
+fn run_command(command: Command) -> crate::error::Result<()> {
+    match command {
+        Command::Tui { path } => {
+            run_tui(path).map_err(|err| AmiximaError::Processing(err.to_string()))
+        }
+        Command::Validate { course, path } => {
+            let course = required_course(course, path)?;
+            let soundcourse = load_and_validate_soundcourse(&course)?;
+            println!(
+                "valid: {} ({} effect{})",
+                course.display(),
+                soundcourse.effect_count(),
+                if soundcourse.effect_count() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+            Ok(())
+        }
+        Command::Inspect { course, path } => {
+            let course = required_course(course, path)?;
+            let soundcourse = load_and_validate_soundcourse(&course)?;
+            println!("id: {}", soundcourse.id);
+            println!("title: {}", soundcourse.title_or_default());
+            if let Some(description) = &soundcourse.description {
+                println!("description: {description}");
+            }
+            if let Some(sample_rate) = soundcourse.sample_rate {
+                println!("sample_rate: {sample_rate}");
+            }
+            println!("effects:");
+            for (index, effect) in soundcourse.sequence.iter().enumerate() {
+                println!("  {}. {}", index + 1, describe_effect(effect));
+            }
+            Ok(())
+        }
+        Command::Apply {
+            course,
+            input,
+            output,
+        } => {
+            let soundcourse = load_and_validate_soundcourse(&course)?;
+            let output_dir = output.unwrap_or_else(|| input.join("output"));
+            std::fs::create_dir_all(&output_dir)
+                .map_err(|err| AmiximaError::io(&output_dir, err))?;
+
+            let mut succeeded = 0usize;
+            let mut failed = 0usize;
+            let mut skipped = 0usize;
+            let entries = std::fs::read_dir(&input).map_err(|err| AmiximaError::io(&input, err))?;
+
+            for entry in entries {
+                let entry = entry.map_err(AmiximaError::from)?;
+                let path = entry.path();
+                if !is_wav_file(&path) {
+                    skipped += 1;
+                    continue;
+                }
+
+                let filename =
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or_else(|| {
+                            AmiximaError::Path(format!(
+                                "could not read filename for {}",
+                                path.display()
+                            ))
+                        })?;
+                let output_path = unique_output_path(&output_dir, filename);
+
+                match Soundsculptor::apply_soundcourse(
+                    path.to_str().unwrap_or_default(),
+                    output_path.to_str().unwrap_or_default(),
+                    &soundcourse,
+                ) {
+                    Ok(()) => {
+                        succeeded += 1;
+                        println!("wrote {}", output_path.display());
+                    }
+                    Err(err) => {
+                        failed += 1;
+                        eprintln!("failed {}: {err}", path.display());
+                    }
+                }
+            }
+
+            println!("summary: {succeeded} succeeded, {failed} failed, {skipped} skipped");
+            if failed > 0 {
+                Err(AmiximaError::Batch(format!("{failed} file(s) failed")))
+            } else {
+                Ok(())
+            }
+        }
+        Command::ListEffects => {
+            print_effect_catalog();
+            Ok(())
+        }
+    }
+}
+
+fn required_course(
+    course: Option<PathBuf>,
+    path: Option<PathBuf>,
+) -> crate::error::Result<PathBuf> {
+    course
+        .or(path)
+        .ok_or_else(|| AmiximaError::Path("missing Soundcourse path".to_string()))
+}
+
+fn load_and_validate_soundcourse(path: &Path) -> crate::error::Result<Soundcourse> {
+    let soundcourse = SoundcourseParser::parse_path(path)?;
+    validate_soundcourse(&soundcourse, ValidationMode::Strict)?;
+    Ok(soundcourse)
+}
+
+fn describe_effect(effect: &EffectNode) -> String {
+    match effect {
+        EffectNode::Gain { gain_db } => format!("Gain gain_db={gain_db}"),
+        EffectNode::EQ { frequency, gain } => {
+            format!("EQ frequency={frequency}Hz gain={gain}dB")
+        }
+        EffectNode::Delay { delay_ms, feedback } => {
+            format!("Delay delay_ms={delay_ms} feedback={feedback}")
+        }
+        EffectNode::Reverb { room_size, dry_wet } => {
+            format!("Reverb room_size={room_size} dry_wet={dry_wet}")
+        }
+        EffectNode::Compressor { threshold, ratio } => {
+            format!("Compressor threshold={threshold}dB ratio={ratio}")
+        }
+    }
+}
+
+fn print_effect_catalog() {
+    println!("Gain: gain_db default=0 range=-24..=24 dB");
+    println!("EQ: frequency default=1000 range=20..=20000 Hz; gain default=0 range=-24..=24 dB");
+    println!("Delay: delay_ms default=100 range=0..=2000 ms; feedback default=0.5 range=0..=0.95");
+    println!("Reverb: room_size default=0.5 range=0..=1; dry_wet default=0.3 range=0..=1");
+    println!("Compressor: threshold default=-20 range=-60..=0 dB; ratio default=4 range=1..=20");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_soundcourse_file_extensions() {
+        assert!(is_soundcourse_file(Path::new("chain.ini")));
+        assert!(is_soundcourse_file(Path::new("chain.json")));
+        assert!(is_soundcourse_file(Path::new("chain.jsonld")));
+        assert!(!is_soundcourse_file(Path::new("chain.wav")));
+    }
+
+    #[test]
+    fn output_path_uses_non_destructive_suffix() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("amixima_test_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir)?;
+        let first = unique_output_path(&dir, "kick.wav");
+        assert_eq!(
+            first.file_name().and_then(|n| n.to_str()),
+            Some("kick_processed.wav")
+        );
+
+        fs::write(&first, [])?;
+        let second = unique_output_path(&dir, "kick.wav");
+        assert_eq!(
+            second.file_name().and_then(|n| n.to_str()),
+            Some("kick_processed_2.wav")
+        );
+
+        fs::remove_file(first)?;
+        fs::remove_dir(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn expands_home_directory_paths() {
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(expand_user_path("~"), PathBuf::from(&home));
+            assert_eq!(
+                expand_user_path("~/samples"),
+                PathBuf::from(home).join("samples")
+            );
+        }
+        assert_eq!(
+            expand_user_path(" /tmp/audio "),
+            PathBuf::from("/tmp/audio")
+        );
+    }
 }

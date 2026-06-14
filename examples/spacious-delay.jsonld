@@ -1,0 +1,38 @@
+{
+  "@context": {
+    "mo": "http://purl.org/ontology/mo/",
+    "aufx": "http://purl.org/ontology/aufx-o/",
+    "dc": "http://purl.org/dc/elements/1.1/",
+    "xsd": "http://www.w3.org/2001/XMLSchema#",
+    "Soundcourse": "mo:Workflow",
+    "sequence": {
+      "@id": "mo:workflow_step",
+      "@container": "@list"
+    },
+    "mo:sampleRate": {
+      "@type": "xsd:float"
+    }
+  },
+  "@id": "amixima:sc:example-spacious-delay",
+  "@type": "mo:Workflow",
+  "dc:title": "Spacious Delay",
+  "dc:description": "Delay and room treatment example for previewing and WAV export.",
+  "mo:sampleRate": 44100.0,
+  "creator": "Amixima",
+  "sequence": [
+    {
+      "aufx:type": "aufx:Delay",
+      "aufx:parameters": {
+        "aufx:delayMs": 180.0,
+        "aufx:feedback": 0.35
+      }
+    },
+    {
+      "aufx:type": "aufx:Reverb",
+      "aufx:parameters": {
+        "aufx:roomSize": 0.55,
+        "aufx:dryWet": 0.28
+      }
+    }
+  ]
+}

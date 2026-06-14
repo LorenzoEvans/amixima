@@ -1,0 +1,30 @@
+{
+  "@context": {
+    "mo": "http://purl.org/ontology/mo/",
+    "aufx": "http://purl.org/ontology/aufx-o/",
+    "dc": "http://purl.org/dc/elements/1.1/",
+    "xsd": "http://www.w3.org/2001/XMLSchema#",
+    "Soundcourse": "mo:Workflow",
+    "sequence": {
+      "@id": "mo:workflow_step",
+      "@container": "@list"
+    },
+    "mo:sampleRate": {
+      "@type": "xsd:float"
+    }
+  },
+  "@id": "amixima:sc:example-clean-gain",
+  "@type": "mo:Workflow",
+  "dc:title": "Clean Gain",
+  "dc:description": "Transparent level lift.",
+  "mo:sampleRate": 44100.0,
+  "creator": "Amixima",
+  "sequence": [
+    {
+      "aufx:type": "aufx:Gain",
+      "aufx:parameters": {
+        "aufx:gainDb": 3.0
+      }
+    }
+  ]
+}

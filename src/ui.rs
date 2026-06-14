@@ -1,7 +1,5 @@
-use ratatui::{
-    style::{Color, Modifier, Style},
-    widgets::{BorderType, Padding},
-};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::BorderType;
 
 /// Modern, vibrant color palette for Amixima
 pub struct Palette {
@@ -50,12 +48,9 @@ impl Symbols {
     pub const DIR_ICON: &'static str = "󰉋 ";
     pub const AUDIO_ICON: &'static str = "󰎆 ";
     pub const CONFIG_ICON: &'static str = "󱁻 ";
-    
+
     // Plain text replacements for broad compatibility but high style
     pub const NAV_INDICATOR: &'static str = " » ";
-    pub const DOT: &'static str = "•";
-    pub const BOX_CHECKED: &'static str = "▣";
-    pub const BOX_EMPTY: &'static str = "□";
 }
 
 pub struct StyleManager {
@@ -102,44 +97,11 @@ impl StyleManager {
         }
     }
 
-    pub fn header_style(&self) -> Style {
-        Style::default()
-            .fg(self.palette.accent_cyan)
-            .bg(self.palette.surface)
-            .add_modifier(Modifier::BOLD)
-    }
-
-    pub fn scrollbar_style(&self) -> Style {
-        Style::default().fg(self.palette.border_inactive)
-    }
-
-    pub fn hint_style(&self) -> Style {
-        Style::default()
-            .fg(self.palette.text_dim)
-            .add_modifier(Modifier::ITALIC)
-    }
-
-    pub fn success_style(&self) -> Style {
-        Style::default().fg(self.palette.success)
-    }
-    
-    pub fn error_style(&self) -> Style {
-        Style::default().fg(self.palette.error)
-    }
-
-    pub fn modal_style(&self) -> Style {
-        Style::default().fg(self.palette.accent_gold)
-    }
-
     pub fn border_type(&self, active: bool) -> BorderType {
         if active {
             BorderType::Thick
         } else {
             BorderType::Rounded
         }
-    }
-
-    pub fn active_padding() -> Padding {
-        Padding::uniform(1)
     }
 }

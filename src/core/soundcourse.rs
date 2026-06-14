@@ -70,7 +70,19 @@ impl Soundcourse {
         }
     }
 
-    pub fn to_json_ld(&self) -> Result<String, serde_json::Error> {
+    pub fn is_empty(&self) -> bool {
+        self.sequence.is_empty()
+    }
+
+    pub fn effect_count(&self) -> usize {
+        self.sequence.len()
+    }
+
+    pub fn title_or_default(&self) -> &str {
+        self.title.as_deref().unwrap_or(&self.id)
+    }
+
+    pub fn to_json_ld(&self) -> std::result::Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }
 

@@ -1,6 +1,12 @@
-use crate::ontology::{EffectNode, Soundcourse};
+use crate::core::soundcourse::{EffectNode, Soundcourse};
+use crate::core::validation::{validate_soundcourse, ValidationMode};
 use color_eyre::Result;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{FromSample, Sample, SampleFormat, SizedSample};
 use hound::{WavSpec, WavWriter};
+use std::fs::File;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error;
@@ -8,10 +14,6 @@ use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
-use std::fs::File;
-use std::path::Path;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::{Arc, Mutex};
 
 pub struct AudioPlayer {
     _stream: Option<cpal::Stream>,
@@ -28,36 +30,96 @@ impl AudioPlayer {
         }
     }
 
-    pub fn play_samples(&mut self, samples: Vec<f32>, _sample_rate: u32, channels: u16) -> Result<()> {
+    pub fn play_samples(
+        &mut self,
+        samples: Vec<f32>,
+        _sample_rate: u32,
+        source_channels: u16,
+    ) -> Result<()> {
         let host = cpal::default_host();
-        let device = host.default_output_device().ok_or_else(|| color_eyre::eyre::eyre!("no output device"))?;
-        let config = device.default_output_config()?;
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| color_eyre::eyre::eyre!("no output device"))?;
+        let supported_config = device.default_output_config()?;
+        let sample_format = supported_config.sample_format();
+        let config: cpal::StreamConfig = supported_config.into();
+        let output_channels = config.channels as usize;
+        let source_channels = source_channels.max(1) as usize;
 
         let samples = Arc::new(Mutex::new(samples));
         let cursor = Arc::new(Mutex::new(0));
 
-        let samples_cb = Arc::clone(&samples);
-        let cursor_cb = Arc::clone(&cursor);
-
-        let stream = device.build_output_stream(
-            &config.into(),
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                let s = match samples_cb.lock() { Ok(s) => s, Err(_) => return };
-                let mut c = match cursor_cb.lock() { Ok(c) => c, Err(_) => return };
-                for frame in data.chunks_mut(channels as usize) {
-                    for sample in frame {
-                        if *c < s.len() {
-                            *sample = s[*c];
-                            *c += 1;
-                        } else {
-                            *sample = 0.0;
-                        }
-                    }
-                }
-            },
-            |err| eprintln!("audio stream error: {}", err),
-            None,
-        )?;
+        let stream = match sample_format {
+            SampleFormat::F32 => Self::build_stream::<f32>(
+                &device,
+                &config,
+                &samples,
+                &cursor,
+                source_channels,
+                output_channels,
+            )?,
+            SampleFormat::I16 => Self::build_stream::<i16>(
+                &device,
+                &config,
+                &samples,
+                &cursor,
+                source_channels,
+                output_channels,
+            )?,
+            SampleFormat::U16 => Self::build_stream::<u16>(
+                &device,
+                &config,
+                &samples,
+                &cursor,
+                source_channels,
+                output_channels,
+            )?,
+            SampleFormat::I8 => Self::build_stream::<i8>(
+                &device,
+                &config,
+                &samples,
+                &cursor,
+                source_channels,
+                output_channels,
+            )?,
+            SampleFormat::U8 => Self::build_stream::<u8>(
+                &device,
+                &config,
+                &samples,
+                &cursor,
+                source_channels,
+                output_channels,
+            )?,
+            SampleFormat::I32 => Self::build_stream::<i32>(
+                &device,
+                &config,
+                &samples,
+                &cursor,
+                source_channels,
+                output_channels,
+            )?,
+            SampleFormat::U32 => Self::build_stream::<u32>(
+                &device,
+                &config,
+                &samples,
+                &cursor,
+                source_channels,
+                output_channels,
+            )?,
+            SampleFormat::F64 => Self::build_stream::<f64>(
+                &device,
+                &config,
+                &samples,
+                &cursor,
+                source_channels,
+                output_channels,
+            )?,
+            format => {
+                return Err(color_eyre::eyre::eyre!(
+                    "unsupported output sample format: {format:?}"
+                ))
+            }
+        };
 
         stream.play()?;
         self._stream = Some(stream);
@@ -65,6 +127,47 @@ impl AudioPlayer {
         self.cursor = cursor;
 
         Ok(())
+    }
+
+    fn build_stream<T>(
+        device: &cpal::Device,
+        config: &cpal::StreamConfig,
+        samples: &Arc<Mutex<Vec<f32>>>,
+        cursor: &Arc<Mutex<usize>>,
+        source_channels: usize,
+        output_channels: usize,
+    ) -> Result<cpal::Stream>
+    where
+        T: SizedSample + Sample + FromSample<f32>,
+    {
+        let samples_cb = Arc::clone(samples);
+        let cursor_cb = Arc::clone(cursor);
+
+        Ok(device.build_output_stream(
+            config,
+            move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+                let s = match samples_cb.lock() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let mut c = match cursor_cb.lock() {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+
+                for frame in data.chunks_mut(output_channels) {
+                    let frame_start = *c;
+                    for (out_idx, sample) in frame.iter_mut().enumerate() {
+                        let source_idx = frame_start + out_idx.min(source_channels - 1);
+                        let value = s.get(source_idx).copied().unwrap_or(0.0);
+                        *sample = T::from_sample(value);
+                    }
+                    *c = c.saturating_add(source_channels);
+                }
+            },
+            |err| eprintln!("audio stream error: {}", err),
+            None,
+        )?)
     }
 
     pub fn stop(&mut self) {
@@ -89,12 +192,14 @@ impl Soundsculptor {
         output_path: &str,
         soundcourse: &Soundcourse,
     ) -> Result<()> {
-        let (final_samples, sample_rate, channels) = Self::get_processed_samples(input_path, soundcourse)?;
+        Self::validate_soundcourse(soundcourse)?;
+        let (final_samples, sample_rate, channels) =
+            Self::get_processed_samples(input_path, soundcourse)?;
 
         // Write back to disk (WAV format)
         let spec = WavSpec {
-            channels: channels as u16,
-            sample_rate: sample_rate as u32,
+            channels,
+            sample_rate,
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
         };
@@ -112,6 +217,7 @@ impl Soundsculptor {
         input_path: &str,
         soundcourse: &Soundcourse,
     ) -> Result<(Vec<f32>, u32, u16)> {
+        Self::validate_soundcourse(soundcourse)?;
         let (mut buf1, sample_rate, channels) = Self::decode_file(input_path)?;
         let mut buf2 = vec![0.0; buf1.len()];
         let mut input_is_buf1 = true;
@@ -147,6 +253,12 @@ impl Soundsculptor {
         Ok((final_samples, sample_rate, channels))
     }
 
+    pub fn validate_soundcourse(soundcourse: &Soundcourse) -> Result<()> {
+        validate_soundcourse(soundcourse, ValidationMode::Strict)
+            .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+        Ok(())
+    }
+
     // ... (rest of methods)
 
     fn apply_gain(input: &[f32], output: &mut [f32], gain_db: f32) {
@@ -165,12 +277,21 @@ impl Soundsculptor {
                 hint.with_extension(ext_str);
             }
         }
-        let probed = symphonia::default::get_probe().format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())?;
+        let probed = symphonia::default::get_probe().format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )?;
         let mut format = probed.format;
-        let track = format.tracks().iter().find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        let track = format
+            .tracks()
+            .iter()
+            .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
             .ok_or_else(|| color_eyre::eyre::eyre!("no audio track"))?;
         let track_id = track.id;
-        let mut decoder = symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
+        let mut decoder = symphonia::default::get_codecs()
+            .make(&track.codec_params, &DecoderOptions::default())?;
 
         let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
         let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2) as u16;
@@ -179,10 +300,14 @@ impl Soundsculptor {
         loop {
             let packet = match format.next_packet() {
                 Ok(packet) => packet,
-                Err(Error::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(Error::IoError(ref e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    break
+                }
                 Err(e) => return Err(e.into()),
             };
-            if packet.track_id() != track_id { continue; }
+            if packet.track_id() != track_id {
+                continue;
+            }
             let decoded = decoder.decode(&packet)?;
             match decoded {
                 AudioBufferRef::F32(buf) => {
@@ -231,7 +356,8 @@ impl Soundsculptor {
 
         for i in 0..input.len() {
             let x0 = input[i];
-            let y0 = (b0 / a0) * x0 + (b1 / a0) * x1 + (b2 / a0) * x2 - (a1 / a0) * y1 - (a2 / a0) * y2;
+            let y0 =
+                (b0 / a0) * x0 + (b1 / a0) * x1 + (b2 / a0) * x2 - (a1 / a0) * y1 - (a2 / a0) * y2;
 
             output[i] = y0;
 
@@ -271,7 +397,13 @@ impl Soundsculptor {
         }
     }
 
-    fn apply_delay(input: &[f32], output: &mut [f32], delay_ms: f32, feedback: f32, sample_rate: f32) {
+    fn apply_delay(
+        input: &[f32],
+        output: &mut [f32],
+        delay_ms: f32,
+        feedback: f32,
+        sample_rate: f32,
+    ) {
         let delay_samples = (delay_ms * sample_rate / 1000.0) as usize;
 
         for i in 0..input.len() {
@@ -317,5 +449,45 @@ impl Soundsculptor {
             };
             output[i] = input[i] * gain;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_supported_effect_ranges() {
+        let mut soundcourse = Soundcourse::new("Tester");
+        soundcourse.sequence.push(EffectNode::EQ {
+            frequency: 1_000.0,
+            gain: 3.0,
+        });
+        soundcourse.sequence.push(EffectNode::Reverb {
+            room_size: 0.5,
+            dry_wet: 0.25,
+        });
+        soundcourse.sequence.push(EffectNode::Delay {
+            delay_ms: 250.0,
+            feedback: 0.3,
+        });
+        soundcourse.sequence.push(EffectNode::Compressor {
+            threshold: -18.0,
+            ratio: 4.0,
+        });
+        soundcourse.sequence.push(EffectNode::Gain { gain_db: 2.0 });
+
+        assert!(Soundsculptor::validate_soundcourse(&soundcourse).is_ok());
+    }
+
+    #[test]
+    fn rejects_out_of_range_effect_parameters() {
+        let mut soundcourse = Soundcourse::new("Tester");
+        soundcourse.sequence.push(EffectNode::EQ {
+            frequency: 5.0,
+            gain: 0.0,
+        });
+
+        assert!(Soundsculptor::validate_soundcourse(&soundcourse).is_err());
     }
 }
