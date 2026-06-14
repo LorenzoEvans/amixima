@@ -4,3 +4,6 @@
 .grok/
 *.grok/
 gemini-git.py
+
+AGENTS.md
+
